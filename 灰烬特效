@@ -1,0 +1,190 @@
+Shader "Unlit/Burn"
+{
+    Properties
+    {
+        _MainTex ("Texture", 2D) = "white" {}
+        _Timeline("Timeline", Range(0,2)) = 0
+        _Direction("Direction", Vector) = (1,0,0,0)
+        _Speed("Speed", Float) = 1
+        _Diffusion("Diffusion", Range(0.5,5)) = 1
+        _Expand("Expand", Range(1,2)) = 2
+    }
+    SubShader
+    {
+        Tags { "RenderType"="Opaque" }
+        LOD 100
+        Cull Off
+
+        Pass
+        {
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma hull Hull
+            #pragma domain Domain
+
+            #include "Library/PackageCache/com.unity.render-pipelines.universal@14.0.11/ShaderLibrary/Core.hlsl"
+
+            float _Timeline;
+            float4 _Direction;
+            float _Speed;
+            float _Diffusion;
+            float _Expand;
+
+            struct appdata
+            {
+                float4 vertex : POSITION;
+                float2 uv : TEXCOORD0;
+                float4 normal : NORMAL;
+            };
+
+            struct TrianglePatchTess
+            {
+                float edgeTess[3] : SV_TessFactor;
+                float insideTess : SV_InsideTessFactor;
+            };
+
+            struct HullOutput
+            {
+                float4 PosOS : TEXCOORD0;
+                float2 uv : TEXCOORD1;
+                float4 CentroidOS : TEXCOORD2;
+                float4 normal : TEXCOORD3;
+            };
+
+            struct Domain2f
+            {
+                float4 PosHC : SV_POSITION;
+                float3 uv_edge : TEXCOORD0;
+            };
+
+            inline float2 unity_voronoi_noise_randomVector(float2 UV)
+            {
+                float2x2 m = float2x2(15.27, 47.63, 99.41, 89.98);
+                UV = frac(sin(mul(UV, m)) * 46839.32);
+                return float2(sin(UV.y * 40) * 0.5 + 0.5, cos(UV.x * 40) * 0.5 + 0.5);
+            }
+
+            float Unity_Voronoi_float(float2 UV)
+            {
+                float2 g = floor(UV * 10);
+                float2 f = frac(UV * 10);
+                float3 res = float3(8.0, 0.0, 0.0);
+
+                for (int y = -1; y <= 1; y++)
+                {
+                    for (int x = -1; x <= 1; x++)
+                    {
+                        float2 lattice = float2(x, y);
+                        float2 offset = unity_voronoi_noise_randomVector(lattice + g);
+                        float d = distance(lattice + offset, f);
+                        if (d < res.x)
+                        {
+                            res = float3(d, offset.x, offset.y);
+                        }
+                    }
+                }
+                return res.x;
+            }
+
+            float Double_Voronoi(float2 UV)
+            {
+                return Unity_Voronoi_float(UV)/1.5 + Unity_Voronoi_float(4*UV)/3+0.3;
+            }
+
+            appdata vert (appdata v)
+            {
+                return v;
+            }
+
+            TrianglePatchTess ComputePatchFactor(InputPatch<appdata, 3> patch, uint patchID : SV_PrimitiveID)
+            {
+                TrianglePatchTess output;
+                for (int i = 0; i < 3; i++)
+                {
+                    output.edgeTess[i] = 1;
+                }
+                output.insideTess = 1;
+                return output;
+            }
+
+            [domain("tri")]
+            [partitioning("integer")]
+            [outputtopology("triangle_cw")]
+            [outputcontrolpoints(4)]
+            [patchconstantfunc("ComputePatchFactor")]
+            [maxtessfactor(64.0)]
+            HullOutput Hull(InputPatch<appdata, 3> patch, uint VID : SV_OutPutControlPointID, uint PID : SV_PrimitiveID)
+            {
+                HullOutput output;
+                output.PosOS = patch[VID].vertex;
+                output.uv = patch[VID].uv;
+                output.CentroidOS = (patch[0].vertex+patch[1].vertex+patch[2].vertex)/3;
+                output.normal = patch[VID].normal;
+                return output;
+            }
+            
+            [domain("tri")]
+            Domain2f Domain(const OutputPatch<HullOutput, 3> patch, float3 bary : SV_DomainLocation,
+        TrianglePatchTess factor)
+            {
+                Domain2f output;
+                float4 positionOS = patch[0].PosOS * bary.x + patch[1].PosOS * bary.y + patch[2].PosOS * bary.z;
+                float4 normal = patch[0].normal * bary.x + patch[1].normal * bary.y + patch[2].normal * bary.z;
+                float4 CentroidOS = patch[0].CentroidOS;
+                float4 OffsetDir = positionOS - CentroidOS;
+                
+                float2 uv = patch[0].uv * bary.x + patch[1].uv * bary.y + patch[2].uv * bary.z;
+                float2 CenUV = (patch[0].uv+patch[1].uv+patch[2].uv)/3;
+
+                float3 DirectionOS = TransformWorldToObjectDir(_Direction,true);
+                float edge = dot(CentroidOS, DirectionOS) + 1;
+                edge = 0 - edge + _Timeline*_Speed;
+                edge -= Unity_Voronoi_float(CenUV) * 0.3;
+                float3 HelpDir = normalize(float3(0,1,1));
+                float3 Difdir = TransformWorldToObjectDir(cross(HelpDir, DirectionOS),true);
+                float4x4 CenTrans2End = float4x4(
+                                _Expand,   0   ,   0   ,Difdir.x * _Diffusion,
+                                   0   ,_Expand,   0   ,Difdir.y * _Diffusion,
+                                   0   ,   0   ,_Expand,Difdir.z * _Diffusion,
+                                   0   ,   0   ,   0   ,         1          );
+
+                float4 EndCenOS = mul(CenTrans2End,CentroidOS);
+                float4 CurCenOS = lerp(CentroidOS,EndCenOS,saturate(edge));
+
+                float3 RA =  normalize(cross(normal.xyz,DirectionOS));
+                float radian = lerp(0,10,saturate(edge));
+                float4x4 DirTrans2Cur = float4x4(
+                                   cos(radian)+RA.x*RA.x*(1-cos(radian))  ,  RA.x*RA.y*(1-cos(radian))-RA.z*sin(radian),RA.x*RA.z*(1-cos(radian))+RA.y*sin(radian),0,
+                                RA.y*RA.x*(1-cos(radian))+RA.z*sin(radian),     cos(radian)+RA.x*RA.x*(1-cos(radian))  ,RA.y*RA.z*(1-cos(radian))-RA.x*sin(radian),0,
+                                RA.z*RA.x*(1-cos(radian))-RA.y*sin(radian),  RA.z*RA.y*(1-cos(radian))+RA.x*sin(radian),   cos(radian)+RA.x*RA.x*(1-cos(radian))  ,0,
+                                                 0                        ,                       0                    ,                      0                   ,1);
+
+                OffsetDir = mul(DirTrans2Cur,OffsetDir);
+                positionOS = CurCenOS + OffsetDir;
+                
+                output.PosHC = TransformObjectToHClip(positionOS);
+                output.uv_edge = float3(uv,1-edge);
+                
+                return output;
+            }
+
+            real4 frag (Domain2f i) : SV_Target
+            {
+                real4 col = 0.4;
+                if(!step(Double_Voronoi(i.uv_edge.xy) + 0.1,i.uv_edge.z)) discard;
+                if(!step(Double_Voronoi(i.uv_edge.xy) + 0.2,i.uv_edge.z))
+                {
+                    col = real4(1,0.361,0,1);
+                    col *= 2;
+                }
+                if(!step(Double_Voronoi(i.uv_edge.xy) + 0.14,i.uv_edge.z))
+                {
+                    col = 0;
+                }
+                return col;
+            }
+            ENDHLSL
+        }
+    }
+}
